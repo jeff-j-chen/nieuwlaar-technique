@@ -1,0 +1,11 @@
+# notebook / assembly environment (any Python >= 3.10); inference uses the separate env from setup_villa_env.sh
+numpy
+zarr>=2.18,<3
+opencv-python-headless
+pillow
+tifffile
+imagecodecs
+matplotlib
+tqdm
+ipykernel
+huggingface_hub

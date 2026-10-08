@@ -1,0 +1,8 @@
+ves_zarrs2/
+ves_zarrs_villa/
+masks/
+models/
+output/
+_ves_tmp/
+__pycache__/
+.ipynb_checkpoints/
