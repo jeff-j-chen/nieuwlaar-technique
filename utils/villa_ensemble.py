@@ -1,7 +1,7 @@
 """villa_ensemble.py -- four-model ink ensemble from Nieuwlaar/pherc343-first-letters, applied to our test surfaces.
 
 Models (sha256-checked against the reference ink/models.tsv, stored in models/villa_ensemble/):
-  dnative   huggingface.co/Nieuwlaar/ink9um-dense-native  (step 16000, .pth rebuilt by fetch_models.sh)
+  dnative   huggingface.co/Nieuwlaar/ink9um-dense-native  (step 16000, rebuilt .pth via rebuild_dense_native_pth.py)
   v8in-1447 huggingface.co/YoussefMoNader/ink-8um-v8in-pherc1447-loo-w062  (replaces ink_9um seed 42)
   ink9-43   huggingface.co/scrollprize/ink_9um  hybrid_3d2d-seed43/step-075000.pth
   hecate    huggingface.co/scrollprize/hecate   hecate_9.6um.pth + hecate.py
@@ -149,8 +149,8 @@ def run_models(scroll_id, depths, directions, compile_model=True, villa_batch=4,
     return maps_dir
 
 
-def read_map(path, shape):
-    """ink map as float32 0..1 on the render grid (ensemble_maps.read_map)."""
+def read_map(path, shape, zero_is_missing=False):
+    """ink map as float32 0..1 on the render grid (ensemble_maps.read_map); NaN where the model made no prediction."""
     import tifffile
 
     if path.lower().endswith(".png"):
@@ -170,6 +170,8 @@ def read_map(path, shape):
             array = array.astype(np.float32)
         if array.shape != tuple(shape):
             raise ValueError(f"{path}: shape {array.shape} != surface {tuple(shape)}")
+    if zero_is_missing:
+        array = np.where(array == 0, np.nan, array)
     return np.ascontiguousarray(array, dtype=np.float32)
 
 
@@ -209,6 +211,8 @@ def ensemble(scroll_id, depths, direction, write_depth):
     sub &= valid
     stats, subs = {}, {}
     for short, key in MODELS:
+        # v8in only predicts tiles fully inside its coverage mask and writes 0 elsewhere
+        missing = key == "v8in-loo-w062"
         # villa maps are uint8 with 129 discrete levels after decoding; hecate/v8in are near-continuous
         villa = key not in ("hecate", "v8in-loo-w062")
         hist = np.zeros(129 if villa else 65536, np.int64)
@@ -216,8 +220,9 @@ def ensemble(scroll_id, depths, direction, write_depth):
         count = 0
         samples = []
         for d in depths:
-            values = read_map(map_path(maps_dir, name, n, key, d, direction), shape)
+            values = read_map(map_path(maps_dir, name, n, key, d, direction), shape, missing)
             v = values[valid]
+            v = v[np.isfinite(v)]
             if villa:
                 hist += np.bincount(np.rint(v * 128).astype(np.int64), minlength=129)[:129]
             else:
@@ -232,15 +237,20 @@ def ensemble(scroll_id, depths, direction, write_depth):
         sd = math.sqrt(max(s2 / count - mean * mean, 0.0)) + 1e-6
         stats[short] = dict(p1=lo, p99_5=hi, mean=mean, sd=sd)
         subs[short] = np.stack(samples)
-    z_grid = sum((subs[short] - stats[short]["mean"]) / stats[short]["sd"] for short, _ in MODELS) / len(MODELS)
-    ens_lo, ens_hi = (float(x) for x in np.percentile(z_grid.ravel(), [P_LO, P_HI]))
-    stretched, z_sum = {}, np.zeros(shape, np.float32)
+    # mean over the models that predicted each pixel
+    z_grid = np.nanmean(np.stack([(subs[short] - stats[short]["mean"]) / stats[short]["sd"] for short, _ in MODELS]), 0)
+    ens_lo, ens_hi = (float(x) for x in np.nanpercentile(z_grid.ravel(), [P_LO, P_HI]))
+    stretched = {}
+    z_sum, z_count = np.zeros(shape, np.float32), np.zeros(shape, np.float32)
     for short, key in MODELS:
-        values = read_map(map_path(maps_dir, name, n, key, write_depth, direction), shape)
+        values = read_map(map_path(maps_dir, name, n, key, write_depth, direction), shape, key == "v8in-loo-w062")
         s = stats[short]
         stretched[short] = np.where(valid, np.clip((values - s["p1"]) / max(s["p99_5"] - s["p1"], 1e-9), 0, 1), np.nan)
-        z_sum += (values - s["mean"]) / s["sd"]
-    ens = np.where(valid, np.clip((z_sum / len(MODELS) - ens_lo) / max(ens_hi - ens_lo, 1e-9), 0, 1), np.nan)
+        z = (values - s["mean"]) / s["sd"]
+        z_sum += np.nan_to_num(z)
+        z_count += np.isfinite(z)
+    ens = np.where(valid & (z_count > 0),
+                   np.clip((z_sum / np.maximum(z_count, 1) - ens_lo) / max(ens_hi - ens_lo, 1e-9), 0, 1), np.nan)
     stats["ensemble"] = dict(p1=ens_lo, p99_5=ens_hi)
     return stretched, ens.astype(np.float32), stats
 
