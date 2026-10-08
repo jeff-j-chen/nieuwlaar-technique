@@ -17,6 +17,7 @@ usage: villa_driver.py --surface <id>.zarr --out <maps_dir> --ckpt-dir <dir> --n
                        [--models ...] [--depths 0 1] [--directions forward reverse]
 """
 import argparse
+import gc
 import importlib.util
 import os
 import sys
@@ -148,13 +149,14 @@ def hecate_prep(vol, native_um, z_center, nz=16, target_um=9.6):
     lo = np.floor(pos).astype(int)
     frac = (pos - lo).astype(np.float32)
     hi = np.minimum(lo + 1, depth - 1)
-    zs = vol[lo].astype(np.float32) * (1 - frac)[:, None, None] + vol[hi].astype(np.float32) * frac[:, None, None]
     s = native_um / target_um
     nh, nw = max(1, int(round(height * s))), max(1, int(round(width * s)))
     interp = cv2.INTER_AREA if s < 0.95 else cv2.INTER_LINEAR
     out = np.empty((nz, nh, nw), np.uint8)
+    # one plane at a time: the full float32 stack is ~13 GB on the largest segments
     for i in range(nz):
-        out[i] = np.clip(cv2.resize(zs[i], (nw, nh), interpolation=interp), 0, 255).astype(np.uint8)
+        plane = vol[lo[i]].astype(np.float32) * (1 - frac[i]) + vol[hi[i]].astype(np.float32) * frac[i]
+        out[i] = np.clip(cv2.resize(plane, (nw, nh), interpolation=interp), 0, 255).astype(np.uint8)
     return out
 
 
@@ -210,6 +212,7 @@ def main():
     ap.add_argument("--hecate-batch", type=int, default=4)
     ap.add_argument("--no-compile", action="store_true", help="skip torch.compile for the villa models")
     a = ap.parse_args()
+    import torch
     import zarr
 
     root = zarr.open(str(a.surface), mode="r")
@@ -225,6 +228,8 @@ def main():
         else:
             run_villa(model_key, a.surface, a.out, a.ckpt_dir, name, n, a.depths, a.directions, a.villa_batch,
                       not a.no_compile)
+        gc.collect()
+        torch.cuda.empty_cache()
     emit("DONE")
     return 0
 
