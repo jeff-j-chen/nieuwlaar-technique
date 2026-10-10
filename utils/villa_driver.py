@@ -47,11 +47,12 @@ def villa_name(name, model, n, d, direction):
     return f"{name}__{model}__L{n}s{s}{'_reverse' if direction == 'reverse' else ''}.tif"
 
 
-def v8in_name(name, n, d, direction):
-    return f"{name}__v8in-loo-w062__L{n}s{(n - 24) // 2 + d}{'_reverse' if direction == 'reverse' else ''}.tif"
+def v8in_name(name, n, d, direction, stride=None):
+    tag = f"st{stride}" if stride else ""
+    return f"{name}__v8in-loo-w062__L{n}s{(n - 24) // 2 + d}{tag}{'_reverse' if direction == 'reverse' else ''}.tif"
 
 
-def run_v8in(surface, out, ckpt_dir, name, n, depths, directions, batch):
+def run_v8in(surface, out, ckpt_dir, name, n, depths, directions, batch, stride=None):
     """YoussefMoNader/ink-8um-v8in-pherc1447-loo-w062 via its own ink8um.predict_stack (24 centred layers + d).
 
     Its training renders (PHerc1447 HF) are stored opposite to our orientation and read reversed, which equals
@@ -59,7 +60,7 @@ def run_v8in(surface, out, ckpt_dir, name, n, depths, directions, batch):
     import tifffile
     import zarr
 
-    todo = [(d, r) for d in depths for r in directions if not (out / v8in_name(name, n, d, r)).exists()]
+    todo = [(d, r) for d in depths for r in directions if not (out / v8in_name(name, n, d, r, stride)).exists()]
     if not todo:
         return
     sys.path.insert(0, str(ckpt_dir / V8IN_DIR))
@@ -71,12 +72,14 @@ def run_v8in(surface, out, ckpt_dir, name, n, depths, directions, batch):
     for d in sorted({d for d, _ in todo}):
         start = (n - model.in_depth) // 2 + d
         if start < 0 or start + model.in_depth > n:
-            raise SystemExit(f"v8in d={d} needs layers {start}..{start + model.in_depth - 1}, outside 0..{n - 1}")
+            print(f"v8in d={d} needs layers {start}..{start + model.in_depth - 1}, outside 0..{n - 1}; skipped",
+                  flush=True)
+            continue
         stack = np.ascontiguousarray(np.clip(vol[start:start + model.in_depth], 0, model.clip_max).transpose(1, 2, 0))
         for direction in [r for dd, r in todo if dd == d]:
-            target = out / v8in_name(name, n, d, direction)
+            target = out / v8in_name(name, n, d, direction, stride)
             t0 = time.time()
-            prob = predict_stack(model, stack, reverse=direction == "reverse", batch_size=batch,
+            prob = predict_stack(model, stack, reverse=direction == "reverse", batch_size=batch, stride=stride,
                                  progress=lambda done, total: emit("PROGRESS", target.name, done, total))
             partial = target.with_name(target.stem + ".partial.tif")
             tifffile.imwrite(partial, (prob * 65535).round().astype(np.uint16), compression="zlib")
@@ -160,7 +163,7 @@ def hecate_prep(vol, native_um, z_center, nz=16, target_um=9.6):
     return out
 
 
-def run_hecate(surface, out, ckpt_dir, name, n, depths, directions, batch, native_um):
+def run_hecate(surface, out, ckpt_dir, name, n, depths, directions, batch, native_um, precision="fp32"):
     import torch
     import zarr
 
@@ -190,7 +193,7 @@ def run_hecate(surface, out, ckpt_dir, name, n, depths, directions, batch, nativ
             t0 = time.time()
             with tempfile.TemporaryDirectory(prefix="hecate-") as tmp:
                 result = np.memmap(Path(tmp) / "prediction", mode="w+", dtype="uint8", shape=prepped.shape[-2:])
-                hecate.predict(model, prepped, result, direction == "reverse", None, batch, "fp32")
+                hecate.predict(model, prepped, result, direction == "reverse", None, batch, precision)
                 partial = target.with_name(target.stem + ".partial.png")
                 hecate.write_png(result, partial)
                 partial.replace(target)
@@ -210,6 +213,9 @@ def main():
     ap.add_argument("--directions", nargs="+", default=["forward", "reverse"], choices=("forward", "reverse"))
     ap.add_argument("--villa-batch", type=int, default=4)
     ap.add_argument("--hecate-batch", type=int, default=4)
+    ap.add_argument("--hecate-precision", default="fp32", choices=("fp32", "bf16"))
+    ap.add_argument("--v8in-stride", type=int, default=None,
+                    help="v8in tile stride (default: model config, 21); maps at other strides are named ...st<stride>")
     ap.add_argument("--no-compile", action="store_true", help="skip torch.compile for the villa models")
     a = ap.parse_args()
     import torch
@@ -222,9 +228,9 @@ def main():
     for model_key in a.models:
         emit("MODEL", model_key)
         if model_key == "hecate":
-            run_hecate(a.surface, a.out, a.ckpt_dir, name, n, a.depths, a.directions, a.hecate_batch, a.native_um)
+            run_hecate(a.surface, a.out, a.ckpt_dir, name, n, a.depths, a.directions, a.hecate_batch, a.native_um, a.hecate_precision)
         elif model_key == "v8in-loo-w062":
-            run_v8in(a.surface, a.out, a.ckpt_dir, name, n, a.depths, a.directions, 16)
+            run_v8in(a.surface, a.out, a.ckpt_dir, name, n, a.depths, a.directions, 16, a.v8in_stride)
         else:
             run_villa(model_key, a.surface, a.out, a.ckpt_dir, name, n, a.depths, a.directions, a.villa_batch,
                       not a.no_compile)
